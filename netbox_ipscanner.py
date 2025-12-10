@@ -1,3 +1,4 @@
+import os
 import socket
 import ipaddress
 import urllib3
@@ -6,191 +7,202 @@ import networkscan
 
 from extras.scripts import Script
 
-# TODO: Do not keep the API token hardcoded in production.
-# Use an environment variable or a NetBox Script input variable instead.
-TOKEN = ""
-NETBOXURL = ""
+NETBOX_URL_ENV = "NETBOX_URL"
+NETBOX_TOKEN_ENV = "NETBOX_TOKEN"
+DEFAULT_NETBOX_URL = ""
 
-# Disable SSL warnings because we explicitly disable certificate verification below.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class IpScan(Script):
     class Meta:
         name = "IP Scanner"
-        description = (
-            "Scans prefixes, updates alive IPs, "
-            "and frees non-responding IPs (deprecated then deleted)"
-        )
+        description = "Scans available prefixes and updates ip addresses in IPAM Module"
 
-    # NetBox Scripts require the (data, commit) signature.
-    # We keep it, but we intentionally ignore `commit` to always apply changes.
     def run(self, data, commit):
+        nb_url = os.getenv(NETBOX_URL_ENV, DEFAULT_NETBOX_URL).strip()
+        nb_token = os.getenv(NETBOX_TOKEN_ENV, "").strip()
+
+        if not nb_token:
+            self.log_failure(
+                f"Variable d'environnement {NETBOX_TOKEN_ENV} absente : impossible de continuer."
+            )
+            return
+        if not nb_url:
+            self.log_failure("URL NetBox manquante (NETBOX_URL).")
+            return
+
+        nb = pynetbox.api(nb_url, token=nb_token)
+        nb.http_session.verify = False
+
+        dns_cache: dict[str, str] = {}
 
         def reverse_lookup(ip: str) -> str:
-            """
-            Perform a DNS reverse lookup (PTR).
-            Returns an empty string if no DNS name is found or if lookup fails.
-            """
+            """DNS reverse lookup avec échec contrôlé et mise en cache."""
+            if ip in dns_cache:
+                return dns_cache[ip]
             try:
                 host, _, _ = socket.gethostbyaddr(ip)
-                return host or ""
+                dns_cache[ip] = host or ""
             except Exception:
-                return ""
+                dns_cache[ip] = ""
+            return dns_cache[ip]
 
         def norm_ip(ip_str: str) -> str:
             """
-            Normalize an IP string to a canonical form (e.g., removes spaces,
-            ensures proper formatting).
-            Returns empty string if invalid.
+            Normalise une IP en string canonique.
+            Retourne '' si invalide.
             """
             try:
                 return str(ipaddress.ip_address(ip_str.strip()))
             except Exception:
                 return ""
 
-        # Create NetBox API client
-        nb = pynetbox.api(NETBOXURL, token=TOKEN)
+        def update_ips(payload: list[dict], desc: str) -> bool:
+            """Met à jour des IPs en respectant le mode dry-run."""
+            if not payload:
+                return True
+            if not commit:
+                self.log_info(f"[DRY-RUN] {desc}")
+                return True
+            try:
+                res = nb.ipam.ip_addresses.update(payload)
+                if not res:
+                    self.log_error(f"Update refusé: {desc}")
+                    return False
+                return True
+            except Exception as exc:
+                self.log_error(f"Erreur lors de {desc}: {exc}")
+                return False
 
-        # Disable TLS certificate verification (internal NetBox with custom cert)
-        nb.http_session.verify = False
+        def create_ip(kwargs: dict, desc: str) -> bool:
+            """Crée une IP en respectant le mode dry-run."""
+            if not commit:
+                self.log_info(f"[DRY-RUN] {desc}")
+                return True
+            try:
+                res = nb.ipam.ip_addresses.create(**kwargs)
+                if not res:
+                    self.log_error(f"Création refusée: {desc}")
+                    return False
+                return True
+            except Exception as exc:
+                self.log_error(f"Erreur création {kwargs.get('address')}: {exc}")
+                return False
 
-        # Retrieve all prefixes from NetBox
         subnets = nb.ipam.prefixes.all()
 
-        # Iterate over every prefix
         for subnet in subnets:
             prefix_str = str(subnet.prefix)
 
-            # Skip prefixes marked as "reserved"
-            try:
-                if subnet.status and subnet.status.value == "reserved":
-                    self.log_warning(f"Scan of {prefix_str} NOT done (reserved)")
-                    continue
-            except Exception:
-                # If status is missing or non-standard, don't block the scan
-                pass
+            status_slug = (
+                getattr(getattr(subnet, "status", None), "value", "") or ""
+            ).lower()
+            if status_slug in {"reserved", "container"}:
+                self.log_warning(f"Scan de {prefix_str} NON fait (status={status_slug})")
+                continue
 
-            # Only handle valid IPv4 prefixes
+            # IPv4 only
             try:
                 ipv4_network = ipaddress.IPv4Network(prefix_str)
             except ValueError:
-                self.log_warning(f"Prefix {prefix_str} ignored (not valid IPv4)")
+                self.log_warning(f"Prefix {prefix_str} ignoré (pas IPv4 valide)")
                 continue
 
-            # Mask to reattach when creating IP objects (e.g. "/24")
             mask = f"/{ipv4_network.prefixlen}"
 
-            # Run ICMP sweep on the prefix
-            scan = networkscan.Networkscan(prefix_str)
-            scan.run()
-            self.log_info(f"Scan of {prefix_str} completed.")
+            # Scan réseau
+            try:
+                scan = networkscan.Networkscan(prefix_str)
+                scan.run()
+            except Exception as exc:
+                self.log_error(f"Scan de {prefix_str} impossible: {exc}")
+                continue
 
-            # Normalize alive hosts list returned by networkscan
+            self.log_info(f"Scan de {prefix_str} terminé.")
+
+            # Normalisation des IP vivantes
             raw_alive = scan.list_of_hosts_found or []
             alive_hosts = set(filter(None, (norm_ip(h) for h in raw_alive)))
 
-            # Build a dict of NetBox IP objects in this prefix.
-            # IMPORTANT: key is IP WITHOUT mask to avoid /32 vs /24 mismatches.
+            # Extraction NetBox -> dict IP sans masque
             netbox_addresses = {}
-            for ip in nb.ipam.ip_addresses.filter(parent=prefix_str):
+            filter_kwargs = {"parent": prefix_str}
+            vrf_id = getattr(getattr(subnet, "vrf", None), "id", None)
+            if vrf_id:
+                filter_kwargs["vrf_id"] = vrf_id
+            for ip in nb.ipam.ip_addresses.filter(**filter_kwargs):
                 ip_no_mask = norm_ip(str(ip.address).split("/")[0])
                 if ip_no_mask:
                     netbox_addresses[ip_no_mask] = ip
 
-            # Debug stats
             self.log_debug(
                 f"{prefix_str}: NetBox={len(netbox_addresses)} IPs, Alive={len(alive_hosts)} IPs"
             )
 
-            # ---- FREE NON-RESPONDING IPs ----
-            # For every IP that exists in NetBox but is not alive:
-            #   1) set status to deprecated (traceability)
-            #   2) delete it (actually free the address for utilization metrics)
-            deprecated_then_deleted = 0
-
+            # Deprecated : IP NetBox non vivante
+            deprecated_count = 0
             for address in ipv4_network.hosts():
                 address_str = str(address)
                 nb_ip = netbox_addresses.get(address_str)
 
                 if nb_ip is not None and address_str not in alive_hosts:
-                    self.log_failure(
-                        f"{prefix_str}: {nb_ip.address} not responding -> DEPRECATED then DELETED"
-                    )
+                    if update_ips(
+                        [{"id": nb_ip.id, "status": "deprecated"}],
+                        f"{prefix_str}: {nb_ip.address} -> deprecated",
+                    ):
+                        deprecated_count += 1
 
-                    # Step 1: mark deprecated
-                    try:
-                        nb.ipam.ip_addresses.update(
-                            [{"id": nb_ip.id, "status": "deprecated"}]
-                        )
-                    except Exception as e:
-                        self.log_error(
-                            f"Error setting deprecated for {nb_ip.address}: {e}"
-                        )
+            self.log_info(f"{prefix_str}: {deprecated_count} IPs passées deprecated")
 
-                    # Step 2: delete the IP object to free it
-                    try:
-                        nb_ip.delete()
-                        deprecated_then_deleted += 1
-                    except Exception as e:
-                        self.log_error(f"Error deleting {nb_ip.address}: {e}")
-
-            self.log_info(
-                f"{prefix_str}: {deprecated_then_deleted} IPs freed (deprecated + delete)"
-            )
-
-            # If nothing is alive, stop here for this prefix
             if not alive_hosts:
-                self.log_warning(f"No hosts found in {prefix_str}")
+                self.log_warning(f"Aucun host trouvé sur {prefix_str}")
                 continue
 
-            self.log_success(f"Alive IPs found: {sorted(alive_hosts)}")
+            self.log_success(f"IPs trouvées: {sorted(alive_hosts)}")
 
-            # ---- PROCESS ALIVE IPs ----
+            # Traitement IP vivantes
+            activated_count = 0
+            dns_updates = 0
+            created_count = 0
+
             for alive in alive_hosts:
                 current = netbox_addresses.get(alive)
 
                 if current is not None:
-                    # If the IP exists in NetBox but is not active, reactivate it
-                    if current.status and current.status.value != "active":
-                        try:
-                            nb.ipam.ip_addresses.update(
-                                [{"id": current.id, "status": "active"}]
-                            )
-                        except Exception as e:
-                            self.log_error(
-                                f"Error setting active for {current.address}: {e}"
-                            )
+                    # Remettre active si besoin
+                    current_status = getattr(current.status, "value", None)
+                    if current_status != "active":
+                        if update_ips(
+                            [{"id": current.id, "status": "active"}],
+                            f"{prefix_str}: {current.address} -> active",
+                        ):
+                            activated_count += 1
 
-                    # Sync DNS name based on reverse lookup
+                    # Sync DNS (ne pas écraser avec une valeur vide)
                     name = reverse_lookup(alive)
                     current_dns = (current.dns_name or "").strip()
-
-                    if current_dns.lower() != name.lower():
-                        self.log_success(f"DNS name for {alive} updated -> {name}")
-                        try:
-                            nb.ipam.ip_addresses.update(
-                                [{"id": current.id, "dns_name": name}]
-                            )
-                        except Exception as e:
-                            self.log_error(
-                                f"Error updating dns_name for {current.address}: {e}"
-                            )
+                    if name and current_dns.lower() != name.lower():
+                        if update_ips(
+                            [{"id": current.id, "dns_name": name}],
+                            f"{prefix_str}: DNS {current_dns or '-'} -> {name}",
+                        ):
+                            dns_updates += 1
 
                 else:
-                    # Alive IP not present in NetBox -> create it as active
+                    # Nouvelle IP vivante -> création
                     name = reverse_lookup(alive)
                     ip_mask = f"{alive}{mask}"
+                    payload = {"address": ip_mask, "status": "active"}
+                    if name:
+                        payload["dns_name"] = name
+                    if vrf_id:
+                        payload["vrf"] = vrf_id
 
-                    try:
-                        res = nb.ipam.ip_addresses.create(
-                            address=ip_mask,
-                            status="active",
-                            dns_name=name
-                        )
-                        if res:
-                            self.log_success(f"Added {alive} - {name}")
-                        else:
-                            self.log_error(f"Adding {alive} - {name} FAILED")
-                    except Exception as e:
-                        self.log_error(f"Error creating {ip_mask}: {e}")
+                    if create_ip(payload, f"{prefix_str}: ajout {ip_mask} ({name or 'sans nom'})"):
+                        created_count += 1
+
+            self.log_info(
+                f"{prefix_str}: {activated_count} réactivées, {dns_updates} DNS mis à jour, "
+                f"{created_count} créées"
+            )
